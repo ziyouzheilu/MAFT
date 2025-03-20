@@ -29,7 +29,7 @@ from .modeling.clip_adapter import (
 )
 from .mask_former_model import MaskFormer
 from .modeling.clip_adapter.clip import build_clip_model, crop_with_mask, CLIP
-
+from .segment_anything import sam_model_registry
 
 @META_ARCH_REGISTRY.register()
 class MAFT(MaskFormer):
@@ -62,7 +62,7 @@ class MAFT(MaskFormer):
         clip_pixel_std, 
         clip_model_name,
         dis_weight,
-
+        backbone_sam: nn.Module = None,
     ):
         """
         Args:
@@ -111,8 +111,12 @@ class MAFT(MaskFormer):
 
         self.test_topk_per_image = test_topk_per_image
 
+        self.backbone_sam = backbone_sam
+
         self.register_buffer("clip_pixel_mean", torch.Tensor(clip_pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("clip_pixel_std", torch.Tensor(clip_pixel_std).view(-1, 1, 1), False)
+        sam_pixel_mean = [123.675, 116.28, 103.53]
+        sam_pixel_std = [58.395, 57.12, 57.375]
         self.ma_loss = nn.SmoothL1Loss()  # SmoothL1Loss L1Loss L2Loss KLLoss
         self.dis_loss = nn.SmoothL1Loss()
         self.dis_weight = dis_weight
@@ -160,6 +164,8 @@ class MAFT(MaskFormer):
             mask_matting=cfg.MODEL.CLIP_ADAPTER.MASK_MATTING,
             region_resized=cfg.MODEL.CLIP_ADAPTER.REGION_RESIZED,
         )
+
+        backbone_sam = sam_model_registry[cfg.MODEL.SAM.MODEL_NAME]()
         
         init_kwargs["clip_adapter"] = clip_adapter
         init_kwargs["clip_ensemble"] = cfg.MODEL.CLIP_ADAPTER.CLIP_ENSEMBLE
@@ -176,6 +182,8 @@ class MAFT(MaskFormer):
         init_kwargs["clip_pixel_mean"]=cfg.MODEL.CLIP_PIXEL_MEAN
         init_kwargs["clip_pixel_std"]=cfg.MODEL.CLIP_PIXEL_STD
         init_kwargs["dis_weight"] = cfg.MODEL.dis_weight
+
+        init_kwargs["backbone_sam"] = backbone_sam
 
         return init_kwargs
 
@@ -228,6 +236,11 @@ class MAFT(MaskFormer):
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
         
+        # sam_images
+        images_input = [x["image"].to(self.device) for x in batched_inputs]
+        images_sam = [(x - self.sam_pixel_mean) / self.sam_pixel_std for x in images_input]
+        images_sam = ImageList.from_tensors(images_sam, self.size_divisibility)
+        image_features_sam = self.backbone_sam(images_sam.tensor)
 
         with torch.no_grad():
             features = self.backbone(images.tensor)
