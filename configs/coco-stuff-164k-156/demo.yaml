@@ -17,6 +17,7 @@ MODEL:
     NUM_CLASSES: 171
     EMBEDDING_DIM: 512
     EMBED_LAYERS: 2
+    PIXEL_DECODER_NAME: "MSDeformAttnPixelDecoder"
   RESNETS:
     DEPTH: 101
     STEM_TYPE: "deeplab"

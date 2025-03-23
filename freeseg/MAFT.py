@@ -12,8 +12,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from detectron2.layers import Conv2d, ShapeSpec
 from detectron2.config import configurable
 from detectron2.data import MetadataCatalog
+from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 from detectron2.modeling import META_ARCH_REGISTRY
 from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
@@ -30,6 +32,35 @@ from .modeling.clip_adapter import (
 from .mask_former_model import MaskFormer
 from .modeling.clip_adapter.clip import build_clip_model, crop_with_mask, CLIP
 from .segment_anything import sam_model_registry
+
+def build_pixel_decoder(cfg, input_shape):
+    """
+    Build a pixel decoder from `cfg.MODEL.MASK_FORMER.PIXEL_DECODER_NAME`.
+    """
+    name = cfg.MODEL.SEM_SEG_HEAD.PIXEL_DECODER_NAME
+    model = SEM_SEG_HEADS_REGISTRY.get(name)(cfg, input_shape)
+    forward_features = getattr(model, "forward_features", None)
+    if not callable(forward_features):
+        raise ValueError(
+            "Only SEM_SEG_HEADS with forward_features method can be used as pixel decoder. "
+            f"Please implement forward_features for {name} to only return mask features."
+        )
+    return model
+
+class LayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.normalized_shape = (normalized_shape,)
+
+    def forward(self, x: torch.Tensor):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
 
 @META_ARCH_REGISTRY.register()
 class MAFT(MaskFormer):
@@ -63,6 +94,7 @@ class MAFT(MaskFormer):
         clip_model_name,
         dis_weight,
         backbone_sam: nn.Module = None,
+        pixel_decoder: nn.Module,
     ):
         """
         Args:
@@ -112,6 +144,17 @@ class MAFT(MaskFormer):
         self.test_topk_per_image = test_topk_per_image
 
         self.backbone_sam = backbone_sam
+        self.clip_name = cfg.MODEL.CLIP_ADAPTER.CLIP_MODEL_NAME
+        self.clip_fusion_layers = nn.ModuleList([nn.Sequential(LayerNorm(clip_in_channels), Conv2d(clip_in_channels, self.pixel_decoder.transformer_in_channels[i], kernel_size=1)) for i in range(3)])
+        self.pixel_decoder = pixel_decoder
+
+
+        if self.clip_name == 'ViT-B/16':
+            self.clip_fusion_feature_layer_idx = [3, 6, 9]
+            clip_in_channels = 768
+        elif self.clip_name == 'ViT-L-14-336':
+            self.clip_fusion_feature_layer_idx = [6, 12, 18]
+            clip_in_channels = 1024
 
         self.register_buffer("clip_pixel_mean", torch.Tensor(clip_pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("clip_pixel_std", torch.Tensor(clip_pixel_std).view(-1, 1, 1), False)
@@ -151,7 +194,7 @@ class MAFT(MaskFormer):
                 print(name, param.requires_grad)
 
     @classmethod
-    def from_config(cls, cfg):
+    def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec]):
         init_kwargs = MaskFormer.from_config(cfg)
         prompt_learner = build_prompt_learner(cfg.MODEL.CLIP_ADAPTER)
 
@@ -184,10 +227,21 @@ class MAFT(MaskFormer):
         init_kwargs["dis_weight"] = cfg.MODEL.dis_weight
 
         init_kwargs["backbone_sam"] = backbone_sam
+        init_kwargs["pixel_decoder"] = build_pixel_decoder(cfg, input_shape)
 
         return init_kwargs
 
 
+    def feature_fusion(self, x, clip_image_features)：
+        res_features = ['res3', 'res4', 'res5']
+        for i in range(len(self.clip_fusion_feature_layer_idx)):
+            b,c,h,w = x[res_features[i]].shape
+            clip_feature = clip_image_features[self.clip_fusion_feature_layer_idx[i]]
+            clip_feature = self.clip_fusion_layers[i](clip_feature)
+            clip_feature = F.interpolate(clip_feature, size=(h,w),mode='bilinear',align_corners=False)
+            x[res_features[i]] = x[res_features[i]] + clip_feature
+        
+        return x
     def forward(self, batched_inputs, text_labels=None):
         """
         Args:
@@ -240,7 +294,6 @@ class MAFT(MaskFormer):
         images_input = [x["image"].to(self.device) for x in batched_inputs]
         images_sam = [(x - self.sam_pixel_mean) / self.sam_pixel_std for x in images_input]
         images_sam = ImageList.from_tensors(images_sam, self.size_divisibility)
-        image_features_sam = self.backbone_sam(images_sam.tensor)
 
         with torch.no_grad():
             features = self.backbone(images.tensor)
@@ -264,8 +317,11 @@ class MAFT(MaskFormer):
             # self distillation loss
             with torch.no_grad():
                 image_features_t = self.clip_adapter.get_image_features(clip_images_480, None)
+                image_features_sam = self.backbone_sam(images_sam.tensor)
+                image_features_t = self.feature_fusion(image_features_sam, image_features_t)
                 image_features_t = image_features_t / image_features_t.norm(dim=-1, keepdim=True)             
                 clip_cls_t = self.clip_adapter.get_sim_logits(text_features, image_features_t) # b*C
+            #学生模型特征提取
             image_features_s = self.IPCLIP(clip_images_480, None)
             image_features_s = image_features_s / image_features_s.norm(dim=-1, keepdim=True)             
             clip_cls_s = self.clip_adapter.get_sim_logits(text_features, image_features_s) # b*C
